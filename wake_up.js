@@ -3,6 +3,8 @@ const fs = require("fs");
 const path = require("path");
 
 const TIMELINE_PATH = path.join(__dirname, "enhanced_messages.json");
+const RUNTIME_STATE_PATH = path.join(__dirname, "runtime_state.json");
+const WAKE_HISTORY_PATH = path.join(__dirname, "wake_history.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -198,6 +200,11 @@ function shouldWake(lastUserTime) {
 }
 
 function getLastUserTime(messages) {
+  try {
+    const state = JSON.parse(fs.readFileSync(RUNTIME_STATE_PATH, "utf8"));
+    const recorded = new Date(state.last_user_at);
+    if (!Number.isNaN(recorded.getTime())) return recorded;
+  } catch {}
   const reversed = [...messages].reverse();
   for (const msg of reversed) {
     if (msg.role === "user") {
@@ -207,6 +214,16 @@ function getLastUserTime(messages) {
     }
   }
   return null;
+}
+
+function appendWakeHistory(entry) {
+  let history = [];
+  try {
+    const current = JSON.parse(fs.readFileSync(WAKE_HISTORY_PATH, "utf8"));
+    if (Array.isArray(current)) history = current;
+  } catch {}
+  history.push(entry);
+  fs.writeFileSync(WAKE_HISTORY_PATH, JSON.stringify(history.slice(-100), null, 2) + "\n", { mode: 0o600 });
 }
 
 function stripPosition(messages) {
@@ -476,6 +493,12 @@ ${historyText}`
   } catch (err) {
     console.error("\n记录唤醒事件失败（Gateway 是否运行？）:\n", err.message);
   }
+
+  appendWakeHistory({
+    time: new Date().toLocaleString("zh-CN", { timeZone: TIME_ZONE }),
+    action: eventContent.includes("刚刚给用户发了 Bark") ? "sent" : "silent",
+    content: eventContent
+  });
 }
 
 // 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
