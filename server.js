@@ -359,6 +359,7 @@ const PREFERRED_ENV_ORDER = [
   "MULTIMODAL_MODE",
   "DAY_WAKE_AFTER_MINUTES",
   "NIGHT_WAKE_AFTER_MINUTES",
+  "NIGHT_WAKE_ENABLED",
   "DAY_CHECK_INTERVAL_MINUTES",
   "NIGHT_CHECK_INTERVAL_MINUTES",
   "WAKE_DAY_START_HOUR",
@@ -819,6 +820,7 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
   const wakeConfig = {
     dayWakeAfter: readEnvValueOrDefault("DAY_WAKE_AFTER_MINUTES", "60"),
     nightWakeAfter: readEnvValueOrDefault("NIGHT_WAKE_AFTER_MINUTES", "120"),
+    nightWakeEnabled: readEnvValueOrDefault("NIGHT_WAKE_ENABLED", "false"),
     dayCheckInterval: readEnvValueOrDefault("DAY_CHECK_INTERVAL_MINUTES", "10"),
     nightCheckInterval: readEnvValueOrDefault("NIGHT_CHECK_INTERVAL_MINUTES", "120"),
     dayStartHour: readEnvValueOrDefault("WAKE_DAY_START_HOUR", "10"),
@@ -1253,6 +1255,11 @@ const html = `<!DOCTYPE html>
         <input name="custom_icon" id="f_icon" value="${escapeHtml(currentIcon)}" placeholder="可选">
 
         <div class="section-title">Wake Settings</div>
+        <label>夜间自动唤醒</label>
+        <select name="night_wake_enabled" id="f_night_wake_enabled">
+          <option value="false" ${wakeConfig.nightWakeEnabled === "true" ? "" : "selected"}>关闭（夜间完全静默，不调用模型）</option>
+          <option value="true" ${wakeConfig.nightWakeEnabled === "true" ? "selected" : ""}>开启</option>
+        </select>
         <div class="grid-2">
           <div>
             <label>白天多久未回复后唤醒（分钟）</label>
@@ -1361,6 +1368,7 @@ const html = `<!DOCTYPE html>
         custom_icon: document.getElementById("f_icon").value.trim(),
         day_wake_after: document.getElementById("f_day_wake_after").value.trim(),
         night_wake_after: document.getElementById("f_night_wake_after").value.trim(),
+        night_wake_enabled: document.getElementById("f_night_wake_enabled").value,
         day_check_interval: document.getElementById("f_day_check_interval").value.trim(),
         night_check_interval: document.getElementById("f_night_check_interval").value.trim(),
         wake_day_start_hour: document.getElementById("f_wake_day_start_hour").value.trim(),
@@ -1477,6 +1485,7 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
       custom_icon,
       day_wake_after,
       night_wake_after,
+      night_wake_enabled,
       day_check_interval,
       night_check_interval,
       wake_day_start_hour,
@@ -1505,6 +1514,7 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
       CUSTOM_ICON_URL: custom_icon || "",
       DAY_WAKE_AFTER_MINUTES: normalizePositiveInteger(day_wake_after, "DAY_WAKE_AFTER_MINUTES", "60"),
       NIGHT_WAKE_AFTER_MINUTES: normalizePositiveInteger(night_wake_after, "NIGHT_WAKE_AFTER_MINUTES", "120"),
+      NIGHT_WAKE_ENABLED: normalizeBooleanString(night_wake_enabled, "NIGHT_WAKE_ENABLED", "false"),
       DAY_CHECK_INTERVAL_MINUTES: normalizePositiveInteger(day_check_interval, "DAY_CHECK_INTERVAL_MINUTES", "10"),
       NIGHT_CHECK_INTERVAL_MINUTES: normalizePositiveInteger(night_check_interval, "NIGHT_CHECK_INTERVAL_MINUTES", "120"),
       WAKE_DAY_START_HOUR: normalizeHour(wake_day_start_hour, "WAKE_DAY_START_HOUR", "10", 0, 23),
