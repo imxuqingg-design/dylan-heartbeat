@@ -20,6 +20,7 @@ app.register(require("@fastify/formbody"));
 
 const PORT = Number(process.env.PORT) || 3000;
 const TARGET_API_URL = process.env.TARGET_API_URL;
+const ANTHROPIC_API_URL = process.env.ANTHROPIC_API_URL || String(TARGET_API_URL || "").replace(/\/chat\/completions$/, "/messages");
 const TIMELINE_FILE = "enhanced_messages.json";
 const TIMESTAMP_DB_FILE = "./message_timestamps.json";
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up";
@@ -349,6 +350,7 @@ const PRESETS_FILE = "./presets.json";
 const ENV_FILE = ".env";
 const PREFERRED_ENV_ORDER = [
   "TARGET_API_URL",
+  "ANTHROPIC_API_URL",
   "TARGET_API_KEY",
   "MODEL_NAME",
   "BARK_KEY",
@@ -371,7 +373,8 @@ const PREFERRED_ENV_ORDER = [
   "TIME_ZONE",
   "RESTART_COMMAND",
   "ADMIN_USER",
-  "ADMIN_PASSWORD"
+  "ADMIN_PASSWORD",
+  "ADMIN_ACCESS_TOKEN"
 ];
 
 function loadPresets() {
@@ -621,6 +624,89 @@ app.post("/v1/chat/completions", async (req, reply) => {
 });
 
 // ========================
+// Anthropic Messages API（保留原生 prompt caching / tool use / SSE）
+// ========================
+app.post("/v1/messages", async (req, reply) => {
+  try {
+    const body = req.body || {};
+    const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
+    const systemMessage = body.system == null
+      ? null
+      : { role: "system", content: body.system };
+    const timelineInput = systemMessage ? [systemMessage, ...incomingMessages] : incomingMessages;
+
+    const tsDB = loadTimestampDB();
+    let tsDBDirty = false;
+    for (const msg of incomingMessages) {
+      const ts = extractTimestamp(normalizeContentToText(msg.content));
+      if (!ts) continue;
+      const fp = makeFingerprint(msg);
+      const fpStripped = makeFingerprintStripped(msg);
+      if (!tsDB[fp]) { tsDB[fp] = ts.toISOString(); tsDBDirty = true; }
+      if (!tsDB[fpStripped]) { tsDB[fpStripped] = ts.toISOString(); tsDBDirty = true; }
+    }
+    if (tsDBDirty) saveTimestampDB(tsDB);
+
+    const oldTimeline = loadTimeline();
+    const finalTimeline = buildTimeline(timelineInput, tsDB);
+    saveTimeline(finalTimeline);
+
+    // Keep every client-provided content block untouched, especially
+    // cache_control, tool_use, tool_result, images, and citations.
+    const forwardedMessages = incomingMessages.map(msg => ({ ...msg }));
+    const oldEvents = stripPosition(oldTimeline.filter(isSpecialEvent));
+    for (const event of oldEvents) {
+      const eventTime = extractTimestampWithMemory(event, tsDB);
+      if (!eventTime) { forwardedMessages.push(event); continue; }
+      let inserted = false;
+      for (let i = 0; i < forwardedMessages.length; i++) {
+        const msgTime = extractTimestampWithMemory(forwardedMessages[i], tsDB);
+        if (msgTime && msgTime >= eventTime) {
+          forwardedMessages.splice(i, 0, event);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) forwardedMessages.push(event);
+    }
+
+    if (!ANTHROPIC_API_URL || !process.env.TARGET_API_KEY) {
+      return reply.code(500).send({ error: "ANTHROPIC_API_URL / TARGET_API_KEY 未配置" });
+    }
+
+    const response = await fetch(ANTHROPIC_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.TARGET_API_KEY}`,
+        "x-api-key": process.env.TARGET_API_KEY,
+        "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
+        ...(req.headers["anthropic-beta"] ? { "anthropic-beta": req.headers["anthropic-beta"] } : {})
+      },
+      body: JSON.stringify({ ...body, messages: forwardedMessages })
+    });
+
+    const contentType = response.headers.get("content-type") || (body.stream ? "text/event-stream" : "application/json");
+    reply.raw.writeHead(response.status, {
+      "Content-Type": contentType,
+      "Cache-Control": body.stream ? "no-cache" : "no-store",
+      Connection: body.stream ? "keep-alive" : "close"
+    });
+    if (!response.body) return reply.raw.end();
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      reply.raw.write(value);
+    }
+    reply.raw.end();
+  } catch (err) {
+    console.error("Anthropic gateway error:", err);
+    if (!reply.sent) reply.code(500).send({ error: err.message });
+  }
+});
+
+// ========================
 // 内部接口：记录唤醒事件
 // ========================
 app.post("/internal/wake-event", async (req, reply) => {
@@ -682,6 +768,11 @@ function normalizeWeatherUnits(value) {
 // HTTP Basic Auth
 // ========================
 function basicAuth(req, reply, done) {
+  const cookies = Object.fromEntries(String(req.headers.cookie || "").split(";").map(v => v.trim().split("=")).filter(v => v.length === 2));
+  if (cookies.dylan_admin === process.env.ADMIN_ACCESS_TOKEN) {
+    done();
+    return;
+  }
   const auth = req.headers.authorization || "";
   const [scheme, encoded] = auth.split(" ");
   if (scheme !== "Basic" || !encoded) {
@@ -699,6 +790,19 @@ function basicAuth(req, reply, done) {
   }
 }
 
+app.get("/login", async (_req, reply) => {
+  reply.type("text/html").send(`<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dylan Heartbeat 登录</title></head><body style="font-family:-apple-system,sans-serif;max-width:420px;margin:60px auto;padding:24px"><h2>Dylan Heartbeat</h2><form method="post"><label>用户名</label><input name="username" autocomplete="username" style="display:block;width:100%;padding:10px;margin:8px 0 18px"><label>密码</label><input name="password" type="password" autocomplete="current-password" style="display:block;width:100%;padding:10px;margin:8px 0 18px"><button style="padding:10px 18px">登录</button></form></body></html>`);
+});
+
+app.post("/login", async (req, reply) => {
+  const { username, password } = req.body || {};
+  if (username !== process.env.ADMIN_USER || password !== process.env.ADMIN_PASSWORD) {
+    return reply.code(401).type("text/html").send("登录失败，请返回重试");
+  }
+  reply.header("Set-Cookie", `dylan_admin=${process.env.ADMIN_ACCESS_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=604800`);
+  reply.type("text/html").send('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><h3>登录成功</h3><a href="./admin">进入管理页</a>');
+});
+
 // ========================
 // 管理页面 GET /admin
 // ========================
@@ -709,6 +813,7 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
     : "离线或未启动";
 
   const currentUrl = readEnvValue("TARGET_API_URL");
+  const currentAnthropicUrl = readEnvValue("ANTHROPIC_API_URL");
   const currentModel = readEnvValue("MODEL_NAME");
   const currentIcon = readEnvValue("CUSTOM_ICON_URL");
   const wakeConfig = {
@@ -1133,8 +1238,11 @@ const html = `<!DOCTYPE html>
     <!-- 配置表单 -->
     <div class="config-box">
       <form id="configForm" onsubmit="saveConfig(event)">
-        <label>API URL</label>
-        <input name="target_url" id="f_url" value="${escapeHtml(currentUrl)}">
+        <label>OpenAI API URL（自动唤醒 / 回退）</label>
+        <input name="target_url" id="f_url" value="${escapeHtml(currentUrl)}" placeholder="https://example.com/v1/chat/completions">
+        <label>Anthropic API URL（Kelivo 原生缓存）</label>
+        <input name="anthropic_url" id="f_anthropic_url" value="${escapeHtml(currentAnthropicUrl)}" placeholder="https://example.com/v1/messages">
+        <div class="hint">切换中转站时同时修改这两个完整接口地址。Kelivo 内的 Heartbeat 地址无需改变。</div>
         <label>API Key</label>
         <input name="target_key" id="f_key" placeholder="留空不修改">
         <label>Model Name</label>
@@ -1207,6 +1315,7 @@ const html = `<!DOCTYPE html>
   <script>
     // ====== 以下脚本保持不变 ======
     const AUTH_HEADER = ${authHeaderJson};
+    const ADMIN_BASE = location.pathname.startsWith("/heartbeat/") ? "/heartbeat/admin" : "/admin";
     let presets = ${presetsJson};
 
     function escapeHtmlText(value) {
@@ -1235,6 +1344,7 @@ const html = `<!DOCTYPE html>
     function applyPreset(idx) {
       const p = presets[idx];
       document.getElementById("f_url").value = p.target_url || "";
+      document.getElementById("f_anthropic_url").value = p.anthropic_url || "";
       document.getElementById("f_model").value = p.model_name || "";
       if (p.target_key) document.getElementById("f_key").value = p.target_key;
       document.querySelector(".config-box").scrollIntoView({ behavior: "smooth" });
@@ -1244,6 +1354,7 @@ const html = `<!DOCTYPE html>
       event.preventDefault();
       const payload = {
         target_url: document.getElementById("f_url").value.trim(),
+        anthropic_url: document.getElementById("f_anthropic_url").value.trim(),
         target_key: document.getElementById("f_key").value.trim(),
         model_name: document.getElementById("f_model").value.trim(),
         bark_key: document.getElementById("f_bark").value.trim(),
@@ -1261,13 +1372,13 @@ const html = `<!DOCTYPE html>
         weather_units: document.getElementById("f_weather_units").value
       };
 
-      if (!payload.target_url || !payload.model_name) {
-        alert("请填写 API 地址和模型名称");
+      if (!payload.target_url || !payload.anthropic_url || !payload.model_name) {
+        alert("请填写 OpenAI、Anthropic API 地址和模型名称");
         return;
       }
 
       try {
-        const resp = await fetch("/admin/save", {
+        const resp = await fetch(ADMIN_BASE + "/save", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": AUTH_HEADER },
           body: JSON.stringify(payload)
@@ -1288,20 +1399,21 @@ const html = `<!DOCTYPE html>
     async function savePreset() {
       const name = document.getElementById("presetName").value.trim();
       const target_url = document.getElementById("f_url").value.trim();
+      const anthropic_url = document.getElementById("f_anthropic_url").value.trim();
       const target_key = document.getElementById("f_key").value.trim();
       const model_name = document.getElementById("f_model").value.trim();
       if (!name) { alert("请填写预设名称"); return; }
-      if (!target_url || !model_name) { alert("请先填写 API 地址和模型名称"); return; }
+      if (!target_url || !anthropic_url || !model_name) { alert("请先填写两个 API 地址和模型名称"); return; }
 
-      const resp = await fetch("/admin/presets/save", {
+      const resp = await fetch(ADMIN_BASE + "/presets/save", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": AUTH_HEADER },
-        body: JSON.stringify({ name, target_url, target_key, model_name })
+        body: JSON.stringify({ name, target_url, anthropic_url, target_key, model_name })
       });
       const r = await resp.json();
       if (r.success) {
         const existing = presets.findIndex(p => p.name === name);
-        const entry = { name, target_url, target_key, model_name };
+        const entry = { name, target_url, anthropic_url, target_key, model_name };
         if (existing >= 0) presets[existing] = entry;
         else presets.push(entry);
         renderPresets();
@@ -1315,7 +1427,7 @@ const html = `<!DOCTYPE html>
     async function deletePreset(idx) {
       const p = presets[idx];
       if (!confirm("删除预设「" + p.name + "」？")) return;
-      await fetch("/admin/presets/delete", {
+      await fetch(ADMIN_BASE + "/presets/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": AUTH_HEADER },
         body: JSON.stringify({ name: p.name })
@@ -1327,7 +1439,7 @@ const html = `<!DOCTYPE html>
     async function restartServices() {
       if (!confirm("确定要重启 Gateway 和 wake_up 吗？")) return;
       try {
-        const resp = await fetch("/admin/restart", {
+        const resp = await fetch(ADMIN_BASE + "/restart", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": AUTH_HEADER },
           body: "{}"
@@ -1358,6 +1470,7 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
   try {
     const {
       target_url,
+      anthropic_url,
       target_key,
       model_name,
       bark_key,
@@ -1375,8 +1488,8 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
       weather_units
     } = req.body || {};
 
-    if (!target_url || !model_name) {
-      return reply.code(400).send({ error: "target_url / model_name 必填" });
+    if (!target_url || !anthropic_url || !model_name) {
+      return reply.code(400).send({ error: "target_url / anthropic_url / model_name 必填" });
     }
 
     const finalTargetKey = target_key || readEnvValue("TARGET_API_KEY");
@@ -1385,6 +1498,7 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
     // 批注 2026-06-26：公开版把唤醒策略和天气信息开放到管理页；保存时做轻量校验，避免空值把运行中的唤醒节奏写坏。
     writeEnvUpdates({
       TARGET_API_URL: target_url,
+      ANTHROPIC_API_URL: anthropic_url,
       TARGET_API_KEY: finalTargetKey,
       MODEL_NAME: model_name,
       BARK_KEY: finalBarkKey,
@@ -1401,7 +1515,8 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
       WEATHER_LON: weather_lon || "",
       WEATHER_UNITS: normalizeWeatherUnits(weather_units),
       ADMIN_USER: readEnvValue("ADMIN_USER"),
-      ADMIN_PASSWORD: readEnvValue("ADMIN_PASSWORD")
+      ADMIN_PASSWORD: readEnvValue("ADMIN_PASSWORD"),
+      ADMIN_ACCESS_TOKEN: readEnvValue("ADMIN_ACCESS_TOKEN")
     });
     console.log("\n✅ .env 已更新，可通过管理页重启服务\n");
 
@@ -1415,7 +1530,7 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
 <body style="text-align:center;font-family:-apple-system,sans-serif;padding:40px;">
   <h2>✅ 配置已保存</h2>
   <p>现在可以返回管理页，点击重启按钮让新配置生效。</p>
-  <a href="/admin">← 返回设置</a>
+  <a href="./admin">← 返回设置</a>
 </body></html>`);
   } catch (err) {
     console.error(err);
@@ -1427,13 +1542,13 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
 // 保存预设方案
 // ========================
 app.post("/admin/presets/save", { preHandler: basicAuth }, async (req, reply) => {
-  const { name, target_url, target_key, model_name } = req.body || {};
-  if (!name || !target_url || !model_name) {
-    return reply.code(400).send({ error: "name / target_url / model_name 必填" });
+  const { name, target_url, anthropic_url, target_key, model_name } = req.body || {};
+  if (!name || !target_url || !anthropic_url || !model_name) {
+    return reply.code(400).send({ error: "name / target_url / anthropic_url / model_name 必填" });
   }
   const presets = loadPresets();
   const existing = presets.findIndex(p => p.name === name);
-  const entry = { name, target_url, target_key: target_key || "", model_name };
+  const entry = { name, target_url, anthropic_url, target_key: target_key || "", model_name };
   if (existing >= 0) presets[existing] = entry;
   else presets.push(entry);
   savePresets(presets);
