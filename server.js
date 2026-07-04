@@ -23,6 +23,8 @@ const TARGET_API_URL = process.env.TARGET_API_URL;
 const ANTHROPIC_API_URL = process.env.ANTHROPIC_API_URL || String(TARGET_API_URL || "").replace(/\/chat\/completions$/, "/messages");
 const TIMELINE_FILE = "enhanced_messages.json";
 const TIMESTAMP_DB_FILE = "./message_timestamps.json";
+const RUNTIME_STATE_FILE = "./runtime_state.json";
+const WAKE_HISTORY_FILE = "./wake_history.json";
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up";
 
 // ========================
@@ -186,6 +188,23 @@ function loadTimestampDB() {
 
 function saveTimestampDB(db) {
   fs.writeJsonSync(TIMESTAMP_DB_FILE, db, { spaces: 2 });
+}
+
+function recordLastUserActivity(messages) {
+  const lastUser = [...(messages || [])].reverse().find(msg => msg?.role === "user");
+  if (!lastUser) return;
+  let state = {};
+  try { state = fs.readJsonSync(RUNTIME_STATE_FILE); } catch {}
+  state.last_user_at = new Date().toISOString();
+  state.last_user_preview = normalizeContentToText(lastUser.content).trim().slice(0, 120);
+  fs.writeJsonSync(RUNTIME_STATE_FILE, state, { spaces: 2 });
+}
+
+function loadWakeHistory() {
+  try {
+    const value = fs.readJsonSync(WAKE_HISTORY_FILE);
+    return Array.isArray(value) ? value : [];
+  } catch { return []; }
 }
 
 function makeFingerprint(msg) {
@@ -463,6 +482,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     console.log("============================\n");
 
     const kelivoMessages = body.messages || [];
+    recordLastUserActivity(kelivoMessages);
     const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
@@ -631,6 +651,7 @@ app.post("/v1/messages", async (req, reply) => {
   try {
     const body = req.body || {};
     const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
+    recordLastUserActivity(incomingMessages);
     const systemMessage = body.system == null
       ? null
       : { role: "system", content: body.system };
@@ -837,6 +858,10 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
   const authToken = Buffer.from(`${process.env.ADMIN_USER}:${process.env.ADMIN_PASSWORD}`).toString("base64");
 
   const presets = loadPresets();
+  const wakeHistory = loadWakeHistory().slice(-20).reverse();
+  const wakeHistoryHtml = wakeHistory.length
+    ? wakeHistory.map(item => `<div style="padding:10px 0;border-bottom:1px solid rgba(220,180,190,.25)"><strong>${escapeHtml(item.action || "unknown")}</strong> · ${escapeHtml(item.time || "")}<div style="margin-top:5px;white-space:pre-wrap;font-size:12px;color:#6d5057">${escapeHtml(item.content || "")}</div></div>`).join("")
+    : '<div style="color:#9a7a82;font-size:12px">暂无真正的模型唤醒记录</div>';
   const presetsJson = safeJsonForInlineScript(presets);
   const authHeaderJson = safeJsonForInlineScript(`Basic ${authToken}`);
 
@@ -1224,6 +1249,11 @@ const html = `<!DOCTYPE html>
     <div class="status">
       <p>Gateway <strong>运行中 (${serverUptime}秒)</strong></p>
       <p>Auto Wakeup <strong>${wakeUpStatus}</strong></p>
+    </div>
+
+    <div class="config-box" style="margin-bottom:24px">
+      <div class="section-title" style="margin-top:0;padding-top:0;border-top:0">最近唤醒记录</div>
+      ${wakeHistoryHtml}
     </div>
 
     <!-- 预设方案 -->
